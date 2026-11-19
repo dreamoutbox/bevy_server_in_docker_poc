@@ -17,16 +17,40 @@ pub const SERVER_TICK_RATE_HZ: f64 = 60.0;
 /// Maximum simultaneous client connections accepted by the server.
 pub const MAX_CLIENTS: usize = 64;
 
+/// Default simulated duration for client-initiated server async work requests.
+pub const DEFAULT_SERVER_ASYNC_DELAY_MS: u64 = 500;
+
+/// Upper bound enforced by the server on client-requested async work duration.
+pub const MAX_SERVER_ASYNC_DELAY_MS: u64 = 5_000;
+
+/// Default simulated duration for local client async tasks.
+pub const DEFAULT_LOCAL_ASYNC_DELAY_MS: u64 = 400;
+
 /// Messages sent from the client to the server over `DefaultChannel::ReliableOrdered`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClientMessage {
-    Ping { seq: u64 },
+    Ping {
+        seq: u64,
+    },
+    /// Requests the server to execute an async background job off the main tick loop.
+    AsyncWorkRequest {
+        job_id: u64,
+        delay_ms: u64,
+    },
 }
 
 /// Messages sent from the server to the client over `DefaultChannel::ReliableOrdered`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ServerMessage {
-    Pong { seq: u64 },
+    Pong {
+        seq: u64,
+    },
+    /// Result produced asynchronously by the server for an [`ClientMessage::AsyncWorkRequest`].
+    AsyncWorkResult {
+        job_id: u64,
+        elapsed_ms: u64,
+        summary: String,
+    },
 }
 
 /// Serializes a protocol message to UTF-8 JSON bytes for transmission over Renet.

@@ -1,3 +1,4 @@
+pub mod async_task;
 pub mod protocol;
 
 #[cfg(feature = "server")]
