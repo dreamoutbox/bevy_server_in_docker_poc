@@ -16,10 +16,12 @@ use bevy_renet::{
 
 use crate::{
     async_task::{AsyncTask, AsyncWorkOutput, simulate_async_work},
+    http_client::{HttpFetchOutcome, configured_example_url, fetch_url},
     protocol::{
         ClientMessage, MAX_CLIENTS, MAX_SERVER_ASYNC_DELAY_MS, PROTOCOL_ID, SERVER_TICK_RATE_HZ,
         ServerMessage, decode_message, encode_message, unix_timestamp,
     },
+    tokio_task::TokioTask,
 };
 
 const STARTUP_WARMUP_DELAY_MS: u64 = 150;
@@ -29,6 +31,13 @@ struct ClientAsyncJobOutcome {
     client_id: ClientId,
     job_id: u64,
     output: AsyncWorkOutput,
+}
+
+/// Result of an async `reqwest` HTTP fetch requested by a connected client.
+struct ClientHttpFetchOutcome {
+    client_id: ClientId,
+    job_id: u64,
+    outcome: HttpFetchOutcome,
 }
 
 /// Builds a headless Bevy server [`App`] bound to `bind_addr` without starting its loop.
@@ -88,6 +97,7 @@ pub fn build_server_app(
                 handle_client_messages,
                 poll_startup_async_tasks,
                 poll_client_async_jobs,
+                poll_client_http_fetches,
             ),
         );
 
@@ -227,6 +237,20 @@ fn handle_client_messages(mut commands: Commands, mut server: ResMut<RenetServer
                         }
                     }));
                 }
+                ClientMessage::HttpFetchRequest { job_id, url } => {
+                    let target_url = url.unwrap_or_else(configured_example_url);
+                    info!(
+                        "Received HttpFetchRequest(job_id={job_id}, url={target_url}) from client {client_id}; spawning reqwest task"
+                    );
+                    commands.spawn(TokioTask::spawn(async move {
+                        let outcome = fetch_url(&target_url).await;
+                        ClientHttpFetchOutcome {
+                            client_id,
+                            job_id,
+                            outcome,
+                        }
+                    }));
+                }
             }
         }
     }
@@ -268,5 +292,60 @@ fn poll_client_async_jobs(
             summary: outcome.output.summary,
         };
         send_server_message(&mut server, outcome.client_id, &reply);
+    }
+}
+
+/// Polls client-requested server `reqwest` tasks and sends [`ServerMessage::HttpFetchResult`].
+///
+/// # Arguments
+/// * `commands` - Bevy [`Commands`] used to despawn completed task entities.
+/// * `server` - Mutable access to the [`RenetServer`] resource.
+/// * `tasks` - Query over in-flight [`TokioTask<ClientHttpFetchOutcome>`] entities.
+fn poll_client_http_fetches(
+    mut commands: Commands,
+    mut server: ResMut<RenetServer>,
+    mut tasks: Query<(Entity, &mut TokioTask<ClientHttpFetchOutcome>)>,
+) {
+    for (entity, mut task) in &mut tasks {
+        let Some(join_result) = task.try_take() else {
+            continue;
+        };
+        commands.entity(entity).despawn();
+
+        let result = match join_result {
+            Ok(res) => res,
+            Err(err) => {
+                error!("Server HTTP Tokio task failed to join: {err}");
+                continue;
+            }
+        };
+
+        info!(
+            "Completed server HTTP fetch #{} for client {} (url={}, status={:?}, elapsed={} ms, err={:?})",
+            result.job_id,
+            result.client_id,
+            result.outcome.url,
+            result.outcome.status_code,
+            result.outcome.elapsed_ms,
+            result.outcome.error
+        );
+
+        if !server.is_connected(result.client_id) {
+            warn!(
+                "Skipping HttpFetchResult(job_id={}) because client {} disconnected",
+                result.job_id, result.client_id
+            );
+            continue;
+        }
+
+        let reply = ServerMessage::HttpFetchResult {
+            job_id: result.job_id,
+            url: result.outcome.url,
+            status_code: result.outcome.status_code,
+            elapsed_ms: result.outcome.elapsed_ms,
+            body_preview: result.outcome.body_preview,
+            error: result.outcome.error,
+        };
+        send_server_message(&mut server, result.client_id, &reply);
     }
 }

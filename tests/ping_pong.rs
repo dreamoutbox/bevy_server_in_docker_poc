@@ -1,7 +1,8 @@
 #![cfg(all(feature = "server", feature = "client"))]
 
 use std::{
-    net::SocketAddr,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener},
     thread,
     time::{Duration, Instant},
 };
@@ -11,7 +12,8 @@ use bevy_renet::RenetClient;
 use bevy_server_in_docker_poc::{
     client::{
         AsyncJobStatus, ClientAsyncState, ClientNetPlugin, ClientPingState, ConnectionStatus,
-        request_server_async_work, send_ping, spawn_local_async_job,
+        HttpJobStatus, request_server_async_work, request_server_http_fetch, send_ping,
+        spawn_local_async_job, spawn_local_http_fetch,
     },
     protocol::DEFAULT_CLIENT_CONNECT_ADDR,
     server::build_server_app,
@@ -174,6 +176,117 @@ fn async_work_on_client_and_server_does_not_block_ping() {
             assert!(summary.contains("server-job-#1"));
         }
         other => panic!("expected completed server async job, got {other:?}"),
+    }
+}
+
+/// Spawns a local mock HTTP/1.1 server handling `expected_requests` sequential GETs.
+fn spawn_mock_http_server(expected_requests: usize, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock HTTP server must bind");
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        for _ in 0..expected_requests {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+
+    format!("http://{addr}/mock")
+}
+
+#[test]
+fn http_fetch_on_client_and_server() {
+    let mock_url = spawn_mock_http_server(2, r#"{"ok":true,"source":"local-mock"}"#);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (mut server_app, server_addr) =
+        build_server_app(bind_addr, false).expect("server must bind ephemeral port");
+    let mut client_app = build_headless_client_app(server_addr);
+
+    drive_until_connected(&mut server_app, &mut client_app);
+
+    let local_url = mock_url.clone();
+    let server_url = mock_url.clone();
+    let (local_job_id, server_job_id) = client_app
+        .world_mut()
+        .run_system_once(
+            move |mut commands: Commands,
+                  mut client: ResMut<RenetClient>,
+                  mut async_state: ResMut<ClientAsyncState>| {
+                let local_job_id =
+                    spawn_local_http_fetch(&mut commands, &mut async_state, local_url.clone());
+                let server_job_id = request_server_http_fetch(
+                    &mut client,
+                    &mut async_state,
+                    Some(server_url.clone()),
+                );
+                (local_job_id, server_job_id)
+            },
+        )
+        .expect("trigger HTTP fetch system must execute");
+
+    assert_eq!(local_job_id, 1);
+    assert_eq!(server_job_id, Some(1));
+
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while Instant::now() < deadline {
+        client_app.update();
+        server_app.update();
+
+        let async_state = client_app.world().resource::<ClientAsyncState>();
+        let local_done = matches!(
+            async_state.local_http_status,
+            HttpJobStatus::Completed { .. }
+        );
+        let server_done = matches!(
+            async_state.server_http_status,
+            HttpJobStatus::Completed { .. }
+        );
+        if local_done && server_done {
+            break;
+        }
+        thread::sleep(STEP_INTERVAL);
+    }
+
+    let async_state = client_app.world().resource::<ClientAsyncState>();
+    match &async_state.local_http_status {
+        HttpJobStatus::Completed {
+            job_id,
+            status_code,
+            body_preview,
+            error,
+            ..
+        } => {
+            assert_eq!(*job_id, 1);
+            assert_eq!(*status_code, Some(200));
+            assert!(error.is_none());
+            assert!(body_preview.contains("local-mock"));
+        }
+        other => panic!("expected completed local HTTP fetch, got {other:?}"),
+    }
+
+    match &async_state.server_http_status {
+        HttpJobStatus::Completed {
+            job_id,
+            status_code,
+            body_preview,
+            error,
+            ..
+        } => {
+            assert_eq!(*job_id, 1);
+            assert_eq!(*status_code, Some(200));
+            assert!(error.is_none());
+            assert!(body_preview.contains("local-mock"));
+        }
+        other => panic!("expected completed server HTTP fetch, got {other:?}"),
     }
 }
 

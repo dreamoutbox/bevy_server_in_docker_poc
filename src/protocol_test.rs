@@ -46,3 +46,31 @@ fn server_async_work_result_round_trip() {
         decode_message(&encoded).expect("decoding AsyncWorkResult must succeed");
     assert_eq!(decoded, original);
 }
+
+#[test]
+fn client_http_fetch_request_round_trip() {
+    let original = ClientMessage::HttpFetchRequest {
+        job_id: 5,
+        url: Some("https://httpbin.org/get".to_string()),
+    };
+    let encoded = encode_message(&original).expect("encoding HttpFetchRequest must succeed");
+    let decoded: ClientMessage =
+        decode_message(&encoded).expect("decoding HttpFetchRequest must succeed");
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn server_http_fetch_result_round_trip() {
+    let original = ServerMessage::HttpFetchResult {
+        job_id: 5,
+        url: "https://httpbin.org/get".to_string(),
+        status_code: Some(200),
+        elapsed_ms: 145,
+        body_preview: "{\"ok\":true}".to_string(),
+        error: None,
+    };
+    let encoded = encode_message(&original).expect("encoding HttpFetchResult must succeed");
+    let decoded: ServerMessage =
+        decode_message(&encoded).expect("decoding HttpFetchResult must succeed");
+    assert_eq!(decoded, original);
+}

@@ -21,15 +21,17 @@ use bevy_renet::{
 
 use crate::{
     async_task::{AsyncTask, AsyncWorkOutput, simulate_async_work},
+    http_client::{HttpFetchOutcome, configured_example_url, fetch_url},
     protocol::{
         ClientMessage, DEFAULT_LOCAL_ASYNC_DELAY_MS, DEFAULT_SERVER_ASYNC_DELAY_MS, PROTOCOL_ID,
         ServerMessage, decode_message, encode_message, unix_timestamp,
     },
+    tokio_task::TokioTask,
 };
 
 const WINDOW_TITLE: &str = "Bevy Server in Docker POC - Client";
-const WINDOW_WIDTH: u32 = 580;
-const WINDOW_HEIGHT: u32 = 480;
+const WINDOW_WIDTH: u32 = 640;
+const WINDOW_HEIGHT: u32 = 620;
 
 const BG_COLOR: Color = Color::srgb(0.10, 0.11, 0.14);
 const TITLE_TEXT_COLOR: Color = Color::srgb(0.95, 0.96, 0.98);
@@ -114,6 +116,23 @@ impl ClientPingState {
     }
 }
 
+/// Lifecycle status of a local or server-side `reqwest` HTTP fetch tracked by the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpJobStatus {
+    Idle,
+    Running {
+        job_id: u64,
+        url: String,
+    },
+    Completed {
+        job_id: u64,
+        status_code: Option<u16>,
+        elapsed_ms: u64,
+        body_preview: String,
+        error: Option<String>,
+    },
+}
+
 /// Tracks both local client async tasks and server-side async RPC requests.
 #[derive(Resource, Debug)]
 pub struct ClientAsyncState {
@@ -121,6 +140,10 @@ pub struct ClientAsyncState {
     pub local_status: AsyncJobStatus,
     pub next_server_job_id: u64,
     pub server_status: AsyncJobStatus,
+    pub next_local_http_job_id: u64,
+    pub local_http_status: HttpJobStatus,
+    pub next_server_http_job_id: u64,
+    pub server_http_status: HttpJobStatus,
 }
 
 impl Default for ClientAsyncState {
@@ -130,6 +153,10 @@ impl Default for ClientAsyncState {
             local_status: AsyncJobStatus::Idle,
             next_server_job_id: 1,
             server_status: AsyncJobStatus::Idle,
+            next_local_http_job_id: 1,
+            local_http_status: HttpJobStatus::Idle,
+            next_server_http_job_id: 1,
+            server_http_status: HttpJobStatus::Idle,
         }
     }
 }
@@ -138,6 +165,12 @@ impl Default for ClientAsyncState {
 struct LocalAsyncJobOutcome {
     job_id: u64,
     output: AsyncWorkOutput,
+}
+
+/// Result produced by a local client async `reqwest` HTTP fetch.
+struct LocalHttpFetchOutcome {
+    job_id: u64,
+    outcome: HttpFetchOutcome,
 }
 
 /// Headless networking and async-task plugin for the client; separated from [`ClientUiPlugin`]
@@ -163,6 +196,7 @@ impl Plugin for ClientNetPlugin {
                     sync_connection_status,
                     receive_server_messages,
                     poll_local_async_jobs,
+                    poll_local_http_fetches,
                 ),
             );
     }
@@ -186,6 +220,8 @@ enum UiLabelKind {
     Pong,
     LocalAsync,
     ServerAsync,
+    LocalHttp,
+    ServerHttp,
 }
 
 /// Identifies each interactive action button in the client UI.
@@ -194,14 +230,16 @@ enum ActionButton {
     Ping,
     LocalAsync,
     ServerAsync,
+    LocalHttpFetch,
+    ServerHttpFetch,
 }
 
 impl ActionButton {
     /// Returns whether this button requires an active server connection.
     fn requires_connection(self) -> bool {
         match self {
-            Self::Ping | Self::ServerAsync => true,
-            Self::LocalAsync => false,
+            Self::Ping | Self::ServerAsync | Self::ServerHttpFetch => true,
+            Self::LocalAsync | Self::LocalHttpFetch => false,
         }
     }
 }
@@ -355,6 +393,82 @@ pub fn request_server_async_work(
     Some(job_id)
 }
 
+/// Spawns a non-blocking local `reqwest` HTTP GET on the Tokio runtime and returns its `job_id`.
+///
+/// # Arguments
+/// * `commands` - Bevy [`Commands`] used to attach the spawned [`TokioTask`] component.
+/// * `async_state` - Mutable [`ClientAsyncState`] updated to [`HttpJobStatus::Running`].
+/// * `url` - Target HTTP/HTTPS URL to fetch.
+///
+/// # Example
+/// ```no_run
+/// use bevy::prelude::*;
+/// use bevy_server_in_docker_poc::client::{ClientAsyncState, spawn_local_http_fetch};
+///
+/// fn trigger_fetch(mut commands: Commands, mut async_state: ResMut<ClientAsyncState>) {
+///     let _job_id = spawn_local_http_fetch(&mut commands, &mut async_state, "https://httpbin.org/get".to_string());
+/// }
+/// ```
+pub fn spawn_local_http_fetch(
+    commands: &mut Commands,
+    async_state: &mut ClientAsyncState,
+    url: String,
+) -> u64 {
+    let job_id = async_state.next_local_http_job_id;
+    async_state.next_local_http_job_id += 1;
+    async_state.local_http_status = HttpJobStatus::Running {
+        job_id,
+        url: url.clone(),
+    };
+
+    info!("Spawning local client reqwest GET job #{job_id} ({url})");
+    commands.spawn(TokioTask::spawn(async move {
+        let outcome = fetch_url(&url).await;
+        LocalHttpFetchOutcome { job_id, outcome }
+    }));
+    job_id
+}
+
+/// Sends a [`ClientMessage::HttpFetchRequest`] to the server if connected, returning the `job_id`.
+///
+/// When `url` is `None`, the server fetches its own configured `HTTP_EXAMPLE_URL`.
+///
+/// # Arguments
+/// * `client` - Mutable access to [`RenetClient`].
+/// * `async_state` - Mutable [`ClientAsyncState`] updated to [`HttpJobStatus::Running`].
+/// * `url` - Optional target URL override; pass `None` to use the server default.
+///
+/// # Example
+/// ```no_run
+/// use bevy::prelude::*;
+/// use bevy_renet::RenetClient;
+/// use bevy_server_in_docker_poc::client::{ClientAsyncState, request_server_http_fetch};
+///
+/// fn trigger_server_fetch(mut client: ResMut<RenetClient>, mut async_state: ResMut<ClientAsyncState>) {
+///     let _job_id = request_server_http_fetch(&mut client, &mut async_state, None);
+/// }
+/// ```
+pub fn request_server_http_fetch(
+    client: &mut RenetClient,
+    async_state: &mut ClientAsyncState,
+    url: Option<String>,
+) -> Option<u64> {
+    let job_id = async_state.next_server_http_job_id;
+    let display_url = url.clone().unwrap_or_else(configured_example_url);
+    let message = ClientMessage::HttpFetchRequest { job_id, url };
+    if !send_client_message(client, &message) {
+        return None;
+    }
+
+    async_state.next_server_http_job_id += 1;
+    async_state.server_http_status = HttpJobStatus::Running {
+        job_id,
+        url: display_url.clone(),
+    };
+    info!("Sent HttpFetchRequest(job_id={job_id}, url={display_url})");
+    Some(job_id)
+}
+
 /// Builds and launches the GUI Bevy client connecting to `server_addr`.
 ///
 /// # Arguments
@@ -455,6 +569,25 @@ fn receive_server_messages(
                     summary,
                 };
             }
+            ServerMessage::HttpFetchResult {
+                job_id,
+                url,
+                status_code,
+                elapsed_ms,
+                body_preview,
+                error,
+            } => {
+                info!(
+                    "Received HttpFetchResult(job_id={job_id}, url={url}, status={status_code:?}, elapsed_ms={elapsed_ms}, err={error:?})"
+                );
+                async_state.server_http_status = HttpJobStatus::Completed {
+                    job_id,
+                    status_code,
+                    elapsed_ms,
+                    body_preview,
+                    error,
+                };
+            }
         }
     }
 }
@@ -484,6 +617,49 @@ fn poll_local_async_jobs(
             job_id: outcome.job_id,
             elapsed_ms: outcome.output.elapsed_ms,
             summary: outcome.output.summary,
+        };
+    }
+}
+
+/// Polls local client `reqwest` tasks on the Tokio runtime and updates [`ClientAsyncState`].
+///
+/// # Arguments
+/// * `commands` - Bevy [`Commands`] used to despawn completed task entities.
+/// * `async_state` - Mutable [`ClientAsyncState`] updated upon task completion.
+/// * `tasks` - Query over in-flight local [`TokioTask<LocalHttpFetchOutcome>`] entities.
+fn poll_local_http_fetches(
+    mut commands: Commands,
+    mut async_state: ResMut<ClientAsyncState>,
+    mut tasks: Query<(Entity, &mut TokioTask<LocalHttpFetchOutcome>)>,
+) {
+    for (entity, mut task) in &mut tasks {
+        let Some(join_result) = task.try_take() else {
+            continue;
+        };
+        commands.entity(entity).despawn();
+
+        let result = match join_result {
+            Ok(res) => res,
+            Err(err) => {
+                error!("Local HTTP Tokio task failed to join: {err}");
+                continue;
+            }
+        };
+
+        info!(
+            "Local client HTTP fetch #{} finished (url={}, status={:?}, elapsed={} ms, err={:?})",
+            result.job_id,
+            result.outcome.url,
+            result.outcome.status_code,
+            result.outcome.elapsed_ms,
+            result.outcome.error
+        );
+        async_state.local_http_status = HttpJobStatus::Completed {
+            job_id: result.job_id,
+            status_code: result.outcome.status_code,
+            elapsed_ms: result.outcome.elapsed_ms,
+            body_preview: result.outcome.body_preview,
+            error: result.outcome.error,
         };
     }
 }
@@ -533,6 +709,12 @@ fn on_action_button_activate(
         }
         ActionButton::ServerAsync => {
             request_server_async_work(&mut client, &mut async_state, DEFAULT_SERVER_ASYNC_DELAY_MS);
+        }
+        ActionButton::LocalHttpFetch => {
+            spawn_local_http_fetch(&mut commands, &mut async_state, configured_example_url());
+        }
+        ActionButton::ServerHttpFetch => {
+            request_server_http_fetch(&mut client, &mut async_state, None);
         }
     }
 }
@@ -666,6 +848,26 @@ fn setup_ui(
         UiLabelKind::ServerAsync,
         format_async_status_text("Server Async", &async_state.server_status),
     );
+    let local_http_button = spawn_action_button(
+        &mut commands,
+        "Fetch Local HTTP",
+        ActionButton::LocalHttpFetch,
+    );
+    let local_http = spawn_status_label(
+        &mut commands,
+        UiLabelKind::LocalHttp,
+        format_http_status_text("Local HTTP", &async_state.local_http_status),
+    );
+    let server_http_button = spawn_action_button(
+        &mut commands,
+        "Fetch Server HTTP",
+        ActionButton::ServerHttpFetch,
+    );
+    let server_http = spawn_status_label(
+        &mut commands,
+        UiLabelKind::ServerHttp,
+        format_http_status_text("Server HTTP", &async_state.server_http_status),
+    );
 
     commands.entity(root).add_children(&[
         title,
@@ -676,6 +878,10 @@ fn setup_ui(
         local_async,
         server_async_button,
         server_async,
+        local_http_button,
+        local_http,
+        server_http_button,
+        server_http,
     ]);
 }
 
@@ -703,6 +909,12 @@ fn update_ui_text(
             }
             UiLabelKind::ServerAsync => {
                 format_async_status_text("Server Async", &async_state.server_status)
+            }
+            UiLabelKind::LocalHttp => {
+                format_http_status_text("Local HTTP", &async_state.local_http_status)
+            }
+            UiLabelKind::ServerHttp => {
+                format_http_status_text("Server HTTP", &async_state.server_http_status)
             }
         };
     }
@@ -788,5 +1000,35 @@ fn format_async_status_text(prefix: &str, status: &AsyncJobStatus) -> String {
             elapsed_ms,
             summary,
         } => format!("{prefix}: #{job_id} {summary} ({elapsed_ms} ms)"),
+    }
+}
+
+/// Formats a local or server `reqwest` HTTP fetch status line.
+///
+/// # Arguments
+/// * `prefix` - Label prefix (e.g. `"Local HTTP"` or `"Server HTTP"`).
+/// * `status` - Current [`HttpJobStatus`] to render.
+fn format_http_status_text(prefix: &str, status: &HttpJobStatus) -> String {
+    match status {
+        HttpJobStatus::Idle => format!("{prefix}: idle"),
+        HttpJobStatus::Running { job_id, url } => {
+            format!("{prefix}: fetching #{job_id} ({url})...")
+        }
+        HttpJobStatus::Completed {
+            job_id,
+            status_code: Some(code),
+            elapsed_ms,
+            body_preview,
+            error: None,
+        } => format!("{prefix}: #{job_id} HTTP {code} ({elapsed_ms} ms) {body_preview}"),
+        HttpJobStatus::Completed {
+            job_id,
+            elapsed_ms,
+            error: Some(err),
+            ..
+        } => format!("{prefix}: #{job_id} error ({elapsed_ms} ms): {err}"),
+        HttpJobStatus::Completed {
+            job_id, elapsed_ms, ..
+        } => format!("{prefix}: #{job_id} completed ({elapsed_ms} ms)"),
     }
 }

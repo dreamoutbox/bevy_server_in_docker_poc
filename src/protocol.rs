@@ -37,6 +37,11 @@ pub enum ClientMessage {
         job_id: u64,
         delay_ms: u64,
     },
+    /// Requests the server to perform an async `reqwest` HTTP GET off the main tick loop.
+    HttpFetchRequest {
+        job_id: u64,
+        url: Option<String>,
+    },
 }
 
 /// Messages sent from the server to the client over `DefaultChannel::ReliableOrdered`.
@@ -50,6 +55,15 @@ pub enum ServerMessage {
         job_id: u64,
         elapsed_ms: u64,
         summary: String,
+    },
+    /// Result of an async `reqwest` HTTP GET executed on the server.
+    HttpFetchResult {
+        job_id: u64,
+        url: String,
+        status_code: Option<u16>,
+        elapsed_ms: u64,
+        body_preview: String,
+        error: Option<String>,
     },
 }
 
